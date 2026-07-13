@@ -1,3 +1,5 @@
+import copy
+
 from easydict import EasyDict as edict
 import yaml
 
@@ -139,6 +141,12 @@ cfg.TEST.SEARCH_FACTOR = 5.0
 cfg.TEST.SEARCH_SIZE = 320
 cfg.TEST.EPOCH = 500
 
+_DEFAULT_CFG = copy.deepcopy(cfg)
+
+
+def clone_default_cfg():
+    return copy.deepcopy(_DEFAULT_CFG)
+
 
 def _edict2dict(dest_dict, src_edict):
     if isinstance(dest_dict, dict) and isinstance(src_edict, dict):
@@ -181,3 +189,9 @@ def update_config_from_file(filename, base_cfg=None):
             _update_config(base_cfg, exp_config)
         else:
             _update_config(cfg, exp_config)
+
+
+def load_config(filename):
+    local_cfg = clone_default_cfg()
+    update_config_from_file(filename, base_cfg=local_cfg)
+    return local_cfg
