@@ -1,6 +1,10 @@
 import math
 
 from lib.models.seatrack import build_ostrack
+from lib.test.evaluation.causal import (
+    freeze_prediction_history,
+    sanitize_initialization_info,
+)
 from lib.test.tracker.basetracker import BaseTracker
 import torch
 
@@ -48,7 +52,14 @@ class OSTrack(BaseTracker):
         self.save_all_boxes = params.save_all_boxes
         self.z_dict1 = {}
 
+    def begin_episode(self, reset_global=True):
+        super().begin_episode(reset_global)
+        self.state = None
+        self.frame_id = 0
+
     def initialize(self, image, info: dict):
+        info = sanitize_initialization_info(info)
+        self._prepare_episode_initialization()
         # forward the template once
         z_patch_arr, resize_factor, z_amask_arr = sample_target(image, info['init_bbox'], self.params.template_factor,
                                                     output_sz=self.params.template_size)
@@ -72,8 +83,8 @@ class OSTrack(BaseTracker):
             return {"all_boxes": all_boxes_save}
 
     def track(self, image, info: dict = None):
+        next_frame_index = self._validate_causal_frame(info)
         H, W, _ = image.shape
-        self.frame_id += 1
         x_patch_arr, resize_factor, x_amask_arr = sample_target(image, self.state, self.params.search_factor,
                                                                 output_sz=self.params.search_size)  # (x1, y1, w, h)
         search = self.preprocessor.process(x_patch_arr, x_amask_arr)
@@ -94,18 +105,30 @@ class OSTrack(BaseTracker):
         pred_box = (pred_boxes.mean(
             dim=0) * self.params.search_size / resize_factor).tolist()  # (cx, cy, w, h) [0,1]
         # get the final box result
-        self.state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
+        next_state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
+        if self.save_all_boxes:
+            '''save all predictions'''
+            all_boxes = self.map_box_back_batch(
+                pred_boxes * self.params.search_size / resize_factor,
+                resize_factor,
+                state=next_state,
+            )
+            all_boxes_save = all_boxes.view(-1).tolist()  # (4N, )
+            result = {"target_bbox": next_state, "all_boxes": all_boxes_save}
+        else:
+            result = {"target_bbox": next_state}
+        freeze_prediction_history(result)
 
         # for debug
         if self.debug:
             if not self.use_visdom:
-                x1, y1, w, h = self.state
+                x1, y1, w, h = next_state
                 image_BGR = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
                 cv2.rectangle(image_BGR, (int(x1),int(y1)), (int(x1+w),int(y1+h)), color=(0,0,255), thickness=2)
-                save_path = os.path.join(self.save_dir, "%04d.jpg" % self.frame_id)
+                save_path = os.path.join(self.save_dir, "%04d.jpg" % next_frame_index)
                 cv2.imwrite(save_path, image_BGR)
             else:
-                self.visdom.register((image, info['gt_bbox'].tolist(), self.state), 'Tracking', 1, 'Tracking')
+                self.visdom.register((image, next_state), 'Tracking', 1, 'Tracking')
 
                 self.visdom.register(torch.from_numpy(x_patch_arr).permute(2, 0, 1), 'image', 1, 'search_region')
                 self.visdom.register(torch.from_numpy(self.z_patch_arr).permute(2, 0, 1), 'image', 1, 'template')
@@ -123,14 +146,8 @@ class OSTrack(BaseTracker):
                         self.step = False
                         break
 
-        if self.save_all_boxes:
-            '''save all predictions'''
-            all_boxes = self.map_box_back_batch(pred_boxes * self.params.search_size / resize_factor, resize_factor)
-            all_boxes_save = all_boxes.view(-1).tolist()  # (4N, )
-            return {"target_bbox": self.state,
-                    "all_boxes": all_boxes_save}
-        else:
-            return {"target_bbox": self.state}
+        self._commit_causal_frame(next_frame_index, next_state)
+        return result
 
     def map_box_back(self, pred_box: list, resize_factor: float):
         cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]
@@ -140,8 +157,9 @@ class OSTrack(BaseTracker):
         cy_real = cy + (cy_prev - half_side)
         return [cx_real - 0.5 * w, cy_real - 0.5 * h, w, h]
 
-    def map_box_back_batch(self, pred_box: torch.Tensor, resize_factor: float):
-        cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]
+    def map_box_back_batch(self, pred_box: torch.Tensor, resize_factor: float, state=None):
+        state = self.state if state is None else state
+        cx_prev, cy_prev = state[0] + 0.5 * state[2], state[1] + 0.5 * state[3]
         cx, cy, w, h = pred_box.unbind(-1) # (N,4) --> (N,)
         half_side = 0.5 * self.params.search_size / resize_factor
         cx_real = cx + (cx_prev - half_side)

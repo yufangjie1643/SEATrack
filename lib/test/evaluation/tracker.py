@@ -1,8 +1,14 @@
 import importlib
 import os
 import pdb
-from collections import OrderedDict
+from collections.abc import Mapping
 from lib.test.evaluation.environment import env_settings
+from lib.test.evaluation.causal import (
+    CausalFrameRecord,
+    call_causal_track,
+    freeze_prediction_history,
+    sanitize_initialization_info,
+)
 import time
 import cv2 as cv
 from lib.utils.lmdb_utils import decode_img
@@ -60,7 +66,7 @@ class Tracker:
         else:
             self.tracker_class = None
 
-    def create_tracker(self, params, mode):
+    def create_tracker(self, params, mode=None):
         tracker = self.tracker_class(params, mode)  # self.dataset_name
         return tracker
 
@@ -89,6 +95,14 @@ class Tracker:
         return output
 
     def _track_sequence(self, tracker, seq, init_info):
+        if getattr(seq, 'multiobj_mode', False):
+            raise ValueError("only single-object evaluation is supported")
+        if not isinstance(getattr(seq, 'init_data', None), Mapping):
+            raise TypeError("seq.init_data must be a mapping")
+        if set(seq.init_data) != {0}:
+            raise ValueError("only frame-zero initialization is supported")
+        init_info = sanitize_initialization_info(init_info)
+
         # Define outputs
         # Each field in output is a list containing tracker prediction for each frame.
 
@@ -126,11 +140,16 @@ class Tracker:
             image = self._read_image(seq.frames[0])
 
         start_time = time.time()
+        tracker.begin_episode(reset_global=True)
         out = tracker.initialize(image, init_info)
         if out is None:
             out = {}
+        if not isinstance(out, Mapping):
+            raise TypeError("tracker.initialize must return a mapping or None")
 
-        prev_output = OrderedDict(out)
+        initial_history = {'target_bbox': list(init_info['init_bbox'])}
+        initial_history.update(out)
+        prev_output = freeze_prediction_history(initial_history)
         init_default = {'target_bbox': init_info.get('init_bbox'),
                         'time': time.time() - start_time,
                         'all_scores': 1}
@@ -148,13 +167,12 @@ class Tracker:
 
             start_time = time.time()
 
-            info = seq.frame_info(frame_num)
-            info['previous_output'] = prev_output
-
-            if len(seq.ground_truth_rect) > 1:
-                info['gt_bbox'] = seq.ground_truth_rect[frame_num]
-            out = tracker.track(image, info)
-            prev_output = OrderedDict(out)
+            record = CausalFrameRecord.from_evaluator(frame_num, prev_output)
+            out = call_causal_track(tracker, image, record)
+            if not isinstance(out, Mapping):
+                raise TypeError("tracker.track must return a mapping")
+            frozen_output = freeze_prediction_history(out)
+            prev_output = frozen_output
             _store_outputs(out, {'time': time.time() - start_time})
 
         for key in ['target_bbox', 'all_boxes', 'all_scores']:
@@ -162,6 +180,27 @@ class Tracker:
                 output.pop(key)
 
         return output
+
+    def _initialize_video_episode(self, tracker, image, box):
+        init_info = sanitize_initialization_info({'init_bbox': box})
+        tracker.begin_episode(reset_global=True)
+        out = tracker.initialize(image, init_info)
+        if out is None:
+            out = {}
+        if not isinstance(out, Mapping):
+            raise TypeError("tracker.initialize must return a mapping or None")
+        initial_history = {'target_bbox': list(init_info['init_bbox'])}
+        initial_history.update(out)
+        previous_output = freeze_prediction_history(initial_history)
+        return 0, previous_output, list(init_info['init_bbox'])
+
+    def _track_video_frame(self, tracker, image, frame_index, previous_output):
+        record = CausalFrameRecord.from_evaluator(frame_index, previous_output)
+        out = call_causal_track(tracker, image, record)
+        if not isinstance(out, Mapping):
+            raise TypeError("tracker.track must return a mapping")
+        frozen_output = freeze_prediction_history(out)
+        return out, frozen_output
 
     def run_video(self, videofilepath, optional_box=None, debug=None, visdom_info=None, save_results=False):
         """Run the tracker with the vieofile.
@@ -180,98 +219,107 @@ class Tracker:
         params.param_name = self.parameter_name
         # self._init_visdom(visdom_info, debug_)
 
-        multiobj_mode = getattr(params, 'multiobj_mode', getattr(self.tracker_class, 'multiobj_mode', 'default'))
-
-        if multiobj_mode == 'default':
-            tracker = self.create_tracker(params)
-
-        elif multiobj_mode == 'parallel':
-            tracker = MultiObjectWrapper(self.tracker_class, params, self.visdom, fast_load=True)
-        else:
-            raise ValueError('Unknown multi object mode {}'.format(multiobj_mode))
-
-        assert os.path.isfile(videofilepath), "Invalid param {}".format(videofilepath)
-        ", videofilepath must be a valid videofile"
-
+        multiobj_mode = getattr(
+            params,
+            'multiobj_mode',
+            getattr(self.tracker_class, 'multiobj_mode', 'default'),
+        )
+        if multiobj_mode != 'default':
+            raise ValueError("run_video supports only single-object default mode")
+        tracker = self.create_tracker(params)
+        if not os.path.isfile(videofilepath):
+            raise ValueError("videofilepath must be an existing file")
         output_boxes = []
-
         cap = cv.VideoCapture(videofilepath)
-        display_name = 'Display: ' + tracker.params.tracker_name
-        cv.namedWindow(display_name, cv.WINDOW_NORMAL | cv.WINDOW_KEEPRATIO)
-        cv.resizeWindow(display_name, 960, 720)
-        success, frame = cap.read()
-        cv.imshow(display_name, frame)
+        try:
+            success, frame = cap.read()
+            if not success or frame is None:
+                raise RuntimeError(f"failed to read first frame from {videofilepath}")
 
-        def _build_init_info(box):
-            return {'init_bbox': box}
+            display_name = 'Display: ' + tracker.params.tracker_name
+            cv.namedWindow(display_name, cv.WINDOW_NORMAL | cv.WINDOW_KEEPRATIO)
+            cv.resizeWindow(display_name, 960, 720)
+            cv.imshow(display_name, frame)
 
-        if success is not True:
-            print("Read frame from {} failed.".format(videofilepath))
-            exit(-1)
-        if optional_box is not None:
-            assert isinstance(optional_box, (list, tuple))
-            assert len(optional_box) == 4, "valid box's foramt is [x,y,w,h]"
-            tracker.initialize(frame, _build_init_info(optional_box))
-            output_boxes.append(optional_box)
-        else:
+            frame_index = 0
+            previous_output = None
+            if optional_box is not None:
+                frame_index, previous_output, init_state = self._initialize_video_episode(
+                    tracker, frame, optional_box
+                )
+                output_boxes.append(init_state)
+            else:
+                frame_disp = frame.copy()
+                cv.putText(
+                    frame_disp,
+                    'Select target ROI and press ENTER',
+                    (20, 30),
+                    cv.FONT_HERSHEY_COMPLEX_SMALL,
+                    1.5,
+                    (0, 0, 0),
+                    1,
+                )
+                x, y, w, h = cv.selectROI(
+                    display_name, frame_disp, fromCenter=False
+                )
+                frame_index, previous_output, init_state = self._initialize_video_episode(
+                    tracker, frame, [x, y, w, h]
+                )
+                output_boxes.append(init_state)
+
             while True:
-                # cv.waitKey()
-                frame_disp = frame.copy()
-
-                cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL,
-                           1.5, (0, 0, 0), 1)
-
-                x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
-                init_state = [x, y, w, h]
-                tracker.initialize(frame, _build_init_info(init_state))
-                output_boxes.append(init_state)
-                break
-
-        while True:
-            ret, frame = cap.read()
-
-            if frame is None:
-                break
-
-            frame_disp = frame.copy()
-
-            # Draw box
-            out = tracker.track(frame)
-            state = [int(s) for s in out['target_bbox']]
-            output_boxes.append(state)
-
-            cv.rectangle(frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
-                         (0, 255, 0), 5)
-
-            font_color = (0, 0, 0)
-            cv.putText(frame_disp, 'Tracking!', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
-            cv.putText(frame_disp, 'Press r to reset', (20, 55), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
-            cv.putText(frame_disp, 'Press q to quit', (20, 80), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
-
-            # Display the resulting frame
-            cv.imshow(display_name, frame_disp)
-            key = cv.waitKey(1)
-            if key == ord('q'):
-                break
-            elif key == ord('r'):
                 ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
                 frame_disp = frame.copy()
 
-                cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1.5,
-                           (0, 0, 0), 1)
+                # Draw box
+                next_frame_index = frame_index + 1
+                out, frozen_output = self._track_video_frame(
+                    tracker, frame, next_frame_index, previous_output
+                )
+                frame_index = next_frame_index
+                previous_output = frozen_output
+                state = [int(s) for s in out['target_bbox']]
+                output_boxes.append(state)
 
+                cv.rectangle(frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
+                             (0, 255, 0), 5)
+
+                font_color = (0, 0, 0)
+                cv.putText(frame_disp, 'Tracking!', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                           font_color, 1)
+                cv.putText(frame_disp, 'Press r to reset', (20, 55), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                           font_color, 1)
+                cv.putText(frame_disp, 'Press q to quit', (20, 80), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                           font_color, 1)
+
+                # Display the resulting frame
                 cv.imshow(display_name, frame_disp)
-                x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
-                init_state = [x, y, w, h]
-                tracker.initialize(frame, _build_init_info(init_state))
-                output_boxes.append(init_state)
+                key = cv.waitKey(1)
+                if key == ord('q'):
+                    break
+                if key == ord('r'):
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        raise RuntimeError("failed to read reset frame")
+                    frame_disp = frame.copy()
 
-        # When everything done, release the capture
-        cap.release()
-        cv.destroyAllWindows()
+                    cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1.5,
+                               (0, 0, 0), 1)
+
+                    cv.imshow(display_name, frame_disp)
+                    x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
+                    frame_index, previous_output, init_state = self._initialize_video_episode(
+                        tracker, frame, [x, y, w, h]
+                    )
+                    output_boxes.append(init_state)
+        finally:
+            try:
+                cap.release()
+            finally:
+                cv.destroyAllWindows()
 
         if save_results:
             if not os.path.exists(self.results_dir):

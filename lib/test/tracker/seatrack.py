@@ -1,5 +1,9 @@
 import math
 from lib.models.seatrack import build_seatrack
+from lib.test.evaluation.causal import (
+    freeze_prediction_history,
+    sanitize_initialization_info,
+)
 from lib.test.tracker.basetracker import BaseTracker
 import torch
 from lib.test.tracker.vis_utils import gen_visualization
@@ -43,7 +47,14 @@ class SEATrack(BaseTracker):
         # for save boxes from all queries
         self.save_all_boxes = params.save_all_boxes
 
+    def begin_episode(self, reset_global=True):
+        super().begin_episode(reset_global)
+        self.state = None
+        self.frame_id = 0
+
     def initialize(self, image, info: dict):
+        info = sanitize_initialization_info(info)
+        self._prepare_episode_initialization()
         # forward the template once
         z_patch_arr, resize_factor, z_amask_arr  = sample_target(image, info['init_bbox'], self.params.template_factor,
                                                     output_sz=self.params.template_size)
@@ -66,9 +77,9 @@ class SEATrack(BaseTracker):
             all_boxes_save = info['init_bbox'] * self.cfg.MODEL.NUM_OBJECT_QUERIES
             return {"all_boxes": all_boxes_save}
 
-    def track(self, image, dataset_name=None, save_name=None, seq_name=None, info: dict = None):
+    def track(self, image, info: dict = None):
+        next_frame_index = self._validate_causal_frame(info)
         H, W, _ = image.shape
-        self.frame_id += 1
         x_patch_arr, resize_factor, x_amask_arr = sample_target(image, self.state, self.params.search_factor,
                                                                 output_sz=self.params.search_size)  # (x1, y1, w, h)
         search = self.preprocessor.process(x_patch_arr)
@@ -90,8 +101,27 @@ class SEATrack(BaseTracker):
         pred_box = (pred_boxes.mean(
             dim=0) * self.params.search_size / resize_factor).tolist()  # (cx, cy, w, h) [0,1]
         # get the final box result
-        self.state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
-        
+        next_state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
+
+        if self.save_all_boxes:
+            '''save all predictions'''
+            all_boxes = self.map_box_back_batch(
+                pred_boxes * self.params.search_size / resize_factor,
+                resize_factor,
+                state=next_state,
+            )
+            all_boxes_save = all_boxes.view(-1).tolist()  # (4N, )
+            result = {
+                "target_bbox": next_state,
+                "all_boxes": all_boxes_save,
+                "best_score": max_score,
+            }
+        else:
+            result = {"target_bbox": next_state, "best_score": max_score}
+        freeze_prediction_history(
+            result, required_keys=("target_bbox", "best_score")
+        )
+
         # for debug
         self.debug = 0
         if self.debug == 1:
@@ -129,7 +159,7 @@ class SEATrack(BaseTracker):
             '''
             fig, axes = plt.subplots(1, 4, figsize=(12, 8)) # 创建一个1行3列的子图窗口
             # 设置窗口左上角标题栏文本
-            fig.canvas.manager.set_window_title(f"Frame ID: {self.frame_id} - amglora")
+            fig.canvas.manager.set_window_title(f"Frame ID: {next_frame_index} - amglora")
             # column 0
             axes[0].imshow(x_patch_arr[:,:,:3])
             axes[0].axis('off')  # 移除坐标轴
@@ -143,22 +173,14 @@ class SEATrack(BaseTracker):
             axes[3].imshow(overlay_inputt2)#, cmap='viridis', interpolation='nearest')
             axes[3].axis('off')
             plt.tight_layout()  # 自动调整子图间的间距
-            # print(self.frame_id)
-            if self.frame_id>=40:
+            # print(next_frame_index)
+            if next_frame_index>=40:
                 plt.show()  
             # plt.show()
             plt.close()
 
-        if self.save_all_boxes:
-            '''save all predictions'''
-            all_boxes = self.map_box_back_batch(pred_boxes * self.params.search_size / resize_factor, resize_factor)
-            all_boxes_save = all_boxes.view(-1).tolist()  # (4N, )
-            return {"target_bbox": self.state,
-                    "all_boxes": all_boxes_save,
-                    "best_score": max_score}
-        else:
-            return {"target_bbox": self.state,
-                    "best_score": max_score}
+        self._commit_causal_frame(next_frame_index, next_state)
+        return result
 
     def map_box_back(self, pred_box: list, resize_factor: float):
         cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]
@@ -168,8 +190,9 @@ class SEATrack(BaseTracker):
         cy_real = cy + (cy_prev - half_side)
         return [cx_real - 0.5 * w, cy_real - 0.5 * h, w, h]
 
-    def map_box_back_batch(self, pred_box: torch.Tensor, resize_factor: float):
-        cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]
+    def map_box_back_batch(self, pred_box: torch.Tensor, resize_factor: float, state=None):
+        state = self.state if state is None else state
+        cx_prev, cy_prev = state[0] + 0.5 * state[2], state[1] + 0.5 * state[3]
         cx, cy, w, h = pred_box.unbind(-1) # (N,4) --> (N,)
         half_side = 0.5 * self.params.search_size / resize_factor
         cx_real = cx + (cx_prev - half_side)

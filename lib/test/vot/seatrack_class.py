@@ -11,6 +11,12 @@ import sys
 import time
 import os
 from lib.test.evaluation import Tracker
+from lib.test.evaluation.causal import (
+    CausalFrameRecord,
+    call_causal_track,
+    freeze_prediction_history,
+    sanitize_initialization_info,
+)
 import lib.test.vot.vot as vot
 from lib.test.vot.vot22_utils import *
 from lib.train.dataset.depth_utils import get_rgbd_frame
@@ -31,20 +37,34 @@ class SEATrack(object):
         file.write(str)
 
     def initialize(self, img_rgb, selection):
-        # init on the 1st frame
-        # region = rect_from_mask(mask)
-        x, y, w, h = selection
-        bbox = [x,y,w,h]
+        init_info = sanitize_initialization_info({'init_bbox': list(selection)})
         self.H, self.W, _ = img_rgb.shape
-        init_info = {'init_bbox': bbox}
-        _ = self.tracker.initialize(img_rgb, init_info)
+        self.tracker.begin_episode(reset_global=True)
+        out = self.tracker.initialize(img_rgb, init_info)
+        if out is None:
+            out = {}
+        if not isinstance(out, dict):
+            raise TypeError("tracker.initialize must return a dict or None")
+        initial_history = {'target_bbox': list(init_info['init_bbox'])}
+        initial_history.update(out)
+        previous_output = freeze_prediction_history(initial_history)
+        self._frame_index = 0
+        self._previous_output = previous_output
 
     def track(self, img_rgb):
-        # track
-        outputs = self.tracker.track(img_rgb)
-        pred_bbox = outputs['target_bbox']
-        max_score = outputs['best_score']  #.max().cpu().numpy()
-        return pred_bbox, max_score
+        next_frame_index = self._frame_index + 1
+        record = CausalFrameRecord.from_evaluator(
+            next_frame_index, self._previous_output
+        )
+        outputs = call_causal_track(self.tracker, img_rgb, record)
+        if not isinstance(outputs, dict):
+            raise TypeError("tracker.track must return a dict")
+        frozen_output = freeze_prediction_history(
+            outputs, required_keys=("target_bbox", "best_score")
+        )
+        self._frame_index = next_frame_index
+        self._previous_output = frozen_output
+        return outputs['target_bbox'], outputs['best_score']
 
 
 def run_vot_exp(tracker_name, para_name, vis=False, out_conf=False, channel_type='color'):

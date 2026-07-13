@@ -4,6 +4,7 @@ import torch
 from _collections import OrderedDict
 
 from lib.train.data.processing_utils import transform_image_to_crop
+from lib.test.evaluation.causal import assert_causal_tracker_info
 from lib.vis.visdom_cus import Visdom
 
 
@@ -13,6 +14,34 @@ class BaseTracker:
     def __init__(self, params):
         self.params = params
         self.visdom = None
+        self._episode_pending_initialization = False
+
+    def begin_episode(self, reset_global=True):
+        if type(reset_global) is not bool:
+            raise TypeError("reset_global must be bool")
+        self._episode_pending_initialization = True
+
+    def _prepare_episode_initialization(self):
+        if not self._episode_pending_initialization:
+            self.begin_episode(reset_global=True)
+        self._episode_pending_initialization = False
+
+    def _validate_causal_frame(self, info):
+        if self._episode_pending_initialization or getattr(self, "state", None) is None:
+            raise RuntimeError("tracker must be initialized before track")
+        assert_causal_tracker_info(info)
+        expected = self.frame_id + 1
+        if info["frame_index"] != expected:
+            raise ValueError(
+                f"expected causal frame_index {expected}, got {info['frame_index']}"
+            )
+        return expected
+
+    def _commit_causal_frame(self, frame_index, next_state):
+        if frame_index != self.frame_id + 1:
+            raise RuntimeError("causal frame commit is stale or out of order")
+        self.state = next_state
+        self.frame_id = frame_index
 
     def predicts_segmentation_mask(self):
         return False
