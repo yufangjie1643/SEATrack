@@ -1,6 +1,8 @@
 # RGB-X Target-Spectral Continual MoE-LoRA Design
 
-> Status: approved design, pending user review of this written specification
+> **SUPERSEDED FOR IMPLEMENTATION:** Do not implement from this specification. Its 384-dimensional rank-8/16/32 Workstream A geometry was disproved by the native LoRP audit. Use the non-executable [`Decision 8 master roadmap`](../plans/2026-07-13-target-spectral-decision8-b4.md) for governance and only a reviewed child plan named there for code edits. This specification is historical context only; omitted requirements are not implementation authority.
+
+> Status: superseded for implementation by Decision 8-B4
 > Date: 2026-07-13
 > Repository: `SEATrack-ProbAlign-VRE`
 > Evidence snapshot: SAME arXiv:2602.01990v2; Prism commit `7154be2a72a4f8e694c4361b7c6e05bb51bf5cc4`; SEATrack commit `793b70f1d7226ceec67bda47bf2c00bb014ac4e7`; literature frozen on 2026-07-13

@@ -1,5 +1,7 @@
 # RGB-X Target-Spectral Workstream A Implementation Plan
 
+> **SUPERSEDED FOR IMPLEMENTATION:** Do not execute this plan. Decision 8 invalidated its post-`linear1` rank-8/16/32 coordinate, rank-selection tasks, and claim that expert inputs stay numerically legacy. Use the non-executable [`Decision 8 master roadmap`](2026-07-13-target-spectral-decision8-b4.md) for governance and only a reviewed child plan named there for code edits. This file is historical protocol context only; no old step is implementation authority.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement and experimentally falsify a strictly causal, bounded target-spectral memory that observes the existing SEATrack HMoE pre-router features and changes only search-token routing logits, while all tracker parameters remain frozen through the Stage 0 (S0) decision.
